@@ -10,6 +10,7 @@ RUN npm run build
 
 # 2) runtime stage: production deps + compiled dist only (smaller image)
 FROM node:20-alpine
+LABEL org.opencontainers.image.source="https://github.com/Anne-Hyeyeon/devops-cicd-practice"
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package*.json ./
