@@ -1,8 +1,8 @@
-name: CI/CD
+name: CI (container)
 
 # Trigger 규칙
-# - feature/** 브랜치 push, main 대상 PR: CI만 실행 (테스트 + 빌드)
-# - main 브랜치 push: CI 성공 후 CD(배포)까지 실행
+# - main, feature/** 브랜치 push: 테스트 후 Docker 이미지를 빌드해 ECR에 push
+# - main 대상 PR: 테스트 + 이미지 빌드만 (push 안 함)
 # - 문서만 바뀐 경우(*.md)는 실행하지 않음
 on:
   push:
@@ -15,104 +15,76 @@ on:
 
 env:
   NODE_VERSION: '20'
-  APP_NAME: sample-server
-  APP_DIR: ~/sample-server
-  APP_PORT: 3000
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: sample-server
+  # 액세스 키 대신 GitHub OIDC로 이 IAM 역할을 맡아 ECR에 push (시크릿 저장 불필요)
+  AWS_ROLE_ARN: arn:aws:iam::976193231337:role/github-actions-ecr-push
+
+permissions:
+  id-token: write # OIDC 토큰 발급
+  contents: read
 
 jobs:
-  ci:
-    name: CI (lint, test, build)
+  test:
+    name: Test (lint, unit, e2e)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
+      - run: npx eslint "{src,test}/**/*.ts"
+      - run: npm test
+      - run: npm run test:e2e
 
-      - name: Lint
-        run: npx eslint "{src,test}/**/*.ts"
-
-      - name: Unit test
-        run: npm test
-
-      - name: E2E test
-        run: npm run test:e2e
-
-      - name: Build
-        run: npm run build
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: server-build
-          path: |
-            dist
-            package.json
-            package-lock.json
-          retention-days: 7
-
-  deploy:
-    name: CD (deploy to EC2)
-    needs: ci
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  image:
+    name: Build image & push to ECR
+    needs: test
     runs-on: ubuntu-latest
-    env:
-      EC2_HOST: ${{ secrets.EC2_HOST }}
-      EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
-      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
     steps:
-      - name: Check deploy secrets
-        id: check
-        run: |
-          if [ -z "$EC2_HOST" ] || [ -z "$EC2_USERNAME" ] || [ -z "$EC2_SSH_PRIVATE_KEY" ]; then
-            echo "EC2 Secrets가 등록되지 않아 배포를 건너뜁니다." >> "$GITHUB_STEP_SUMMARY"
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          fi
+      - uses: actions/checkout@v4
 
-      - name: Download build artifact
-        if: steps.check.outputs.ready == 'true'
-        uses: actions/download-artifact@v4
+      - name: Configure AWS credentials (OIDC)
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          name: server-build
-          path: build
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Setup SSH key
-        if: steps.check.outputs.ready == 'true'
-        run: |
-          mkdir -p ~/.ssh
-          echo "$EC2_SSH_PRIVATE_KEY" > ~/.ssh/ec2.pem
-          chmod 600 ~/.ssh/ec2.pem
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+      - name: Login to Amazon ECR
+        id: ecr
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Copy files to EC2 (scp)
-        if: steps.check.outputs.ready == 'true'
+      - name: Image tags (version + commit + latest)
+        id: meta
         run: |
-          ssh -i ~/.ssh/ec2.pem $EC2_USERNAME@$EC2_HOST "mkdir -p ${{ env.APP_DIR }}"
-          scp -i ~/.ssh/ec2.pem -r build/dist build/package.json build/package-lock.json \
-            $EC2_USERNAME@$EC2_HOST:${{ env.APP_DIR }}/
+          REGISTRY="${{ steps.ecr.outputs.registry || 'local' }}"
+          IMAGE="$REGISTRY/${{ env.ECR_REPOSITORY }}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          VERSION="v1.0.${{ github.run_number }}"
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:$VERSION"
+            echo "$IMAGE:$SHORT_SHA"
+            echo "$IMAGE:latest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Image tags" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$VERSION\`, \`$SHORT_SHA\`, \`latest\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Restart process (pm2)
-        if: steps.check.outputs.ready == 'true'
-        run: |
-          ssh -i ~/.ssh/ec2.pem $EC2_USERNAME@$EC2_HOST << 'EOF'
-            cd ~/sample-server
-            npm ci --omit=dev
-            pm2 delete sample-server || true
-            pm2 start dist/main.js --name sample-server
-            pm2 save
-          EOF
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Health check
-        if: steps.check.outputs.ready == 'true'
-        run: |
-          sleep 5
-          curl -fsS http://$EC2_HOST:${{ env.APP_PORT }}/
+      - name: Build (and push on non-PR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64 # EC2(x86_64)에서 exec format error 방지
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha # 레이어 캐시로 빌드 시간 단축
+          cache-to: type=gha,mode=max
